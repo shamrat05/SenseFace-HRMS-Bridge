@@ -24,6 +24,7 @@ PORT = int(os.getenv("SENSEFACE_PORT", "8090"))
 API_KEY = os.getenv("SENSEFACE_API_KEY", "")
 LOCK = threading.Lock()
 ATT_RE = re.compile(r"^(?:PIN=)?([^\t]+)\t(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\t([^\t]*)(?:\t([^\t]*))?(?:\t([^\t]*))?(?:\t([^\t]*))?")
+USER_RE = re.compile(r"^(?:USER\s+)?PIN=([^\t]+)\t(.*)$")
 
 
 def now():
@@ -55,6 +56,11 @@ def initialize():
           event_time TEXT NOT NULL, status TEXT, verify_mode TEXT,
           work_code TEXT, reserved TEXT, raw_line TEXT NOT NULL,
           received_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS employees(
+          serial_number TEXT NOT NULL, employee_id TEXT NOT NULL,
+          name TEXT, privilege TEXT, card TEXT, raw_line TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(serial_number, employee_id));
         CREATE INDEX IF NOT EXISTS attendance_time_idx ON attendance(event_time);
         CREATE INDEX IF NOT EXISTS attendance_employee_idx ON attendance(employee_id);
         CREATE INDEX IF NOT EXISTS attendance_device_idx ON attendance(serial_number);
@@ -86,6 +92,23 @@ def save_push(sn, table, query, body, remote_ip):
                   (event_key, sn, employee, event_time, status or "", verify or "",
                    work or "", reserved or "", line.strip(), received))
                 inserted += cur.rowcount
+        for line in text.splitlines():
+            match = USER_RE.match(line.strip())
+            if not match:
+                continue
+            employee_id, fields_text = match.groups()
+            fields = {}
+            for item in fields_text.split("\t"):
+                if "=" in item:
+                    key, value = item.split("=", 1)
+                    fields[key] = value
+            con.execute("""INSERT INTO employees
+              (serial_number,employee_id,name,privilege,card,raw_line,updated_at)
+              VALUES(?,?,?,?,?,?,?) ON CONFLICT(serial_number,employee_id) DO UPDATE SET
+              name=excluded.name,privilege=excluded.privilege,card=excluded.card,
+              raw_line=excluded.raw_line,updated_at=excluded.updated_at""",
+              (sn, employee_id, fields.get("Name", ""), fields.get("Pri", ""),
+               fields.get("Card", ""), line.strip(), received))
     return inserted
 
 
@@ -148,6 +171,14 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return self.json({"error": "unauthorized"}, 401)
             self.attendance(uri, q)
+        elif uri.path == "/api/v1/employees":
+            if not self.authorized():
+                return self.json({"error": "unauthorized"}, 401)
+            with db() as con:
+                records = rows_json(con.execute(
+                    "SELECT * FROM employees ORDER BY serial_number, employee_id"
+                ).fetchall())
+            self.json({"count": len(records), "data": records})
         else:
             self.json({"error": "not_found"}, 404)
 
@@ -163,7 +194,10 @@ class Handler(BaseHTTPRequestHandler):
             clauses.append("event_time >= ?"); args.append(q["from"][0])
         if q.get("to"):
             clauses.append("event_time <= ?"); args.append(q["to"][0])
-        sql = "SELECT * FROM attendance WHERE " + " AND ".join(clauses) + " ORDER BY id LIMIT ?"
+        qualified = [clause.replace("id >", "a.id >").replace("event_time", "a.event_time").replace("employee_id", "a.employee_id").replace("serial_number", "a.serial_number") for clause in clauses]
+        sql = """SELECT a.*, e.name AS employee_name FROM attendance a
+          LEFT JOIN employees e ON e.serial_number=a.serial_number AND e.employee_id=a.employee_id
+          WHERE """ + " AND ".join(qualified) + " ORDER BY a.id LIMIT ?"
         with db() as con:
             records = rows_json(con.execute(sql, args + [limit]).fetchall())
         if uri.path.endswith(".csv"):
@@ -203,3 +237,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+

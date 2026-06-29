@@ -89,3 +89,9 @@ $env:SENSEFACE_API_KEY = 'replace-with-a-long-random-value'
 ```
 
 Do not expose port 8090 directly to the public internet. Put an authenticated HTTPS reverse proxy or VPN in front if remote access is required.
+
+## Employee directory
+
+Endpoint: GET /api/v1/employees
+
+Employee names are stored in the employees table. Attendance JSON includes employee_name when the device has pushed the corresponding USER record.
