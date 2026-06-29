@@ -1,6 +1,11 @@
 # SenseFace HRMS Bridge
 
-Standalone receiver for ZKTeco SenseFace attendance terminals using the T&A Push/ADMS HTTP protocol. It requires no CVAccess, Node package, Python package, or cloud service.
+ZKTeco network attendance devices use two main communication models:
+
+- **Pull devices:** Mostly older terminals. HR software connects to the device—commonly on port 4370—and downloads records.
+- **Push devices:** Modern terminals such as **SenseFace 2A**. The device sends attendance records by HTTP to a configured server; port-4370 pull libraries do not work with this mode.
+
+This project is a standalone T&A Push/ADMS HTTP receiver for SenseFace 2A and compatible ZKTeco push devices. It stores incoming records in SQLite and exposes them through JSON and CSV APIs for HRMS integration. It requires no CVAccess, Node package, Python package, or cloud service.
 
 ## Device configuration
 
@@ -95,3 +100,4 @@ Do not expose port 8090 directly to the public internet. Put an authenticated HT
 Endpoint: GET /api/v1/employees
 
 Employee names are stored in the employees table. Attendance JSON includes employee_name when the device has pushed the corresponding USER record.
+
