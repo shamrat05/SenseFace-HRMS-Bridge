@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""Standalone ZKTeco SenseFace T&A Push to HRMS bridge."""
+
+import csv
+import hashlib
+import io
+import json
+import os
+import re
+import signal
+import sqlite3
+import threading
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+ROOT = Path(__file__).resolve().parent
+DATA = ROOT / "data"
+DATA.mkdir(exist_ok=True)
+DB_PATH = DATA / "senseface_hrms.db"
+HOST = os.getenv("SENSEFACE_HOST", "0.0.0.0")
+PORT = int(os.getenv("SENSEFACE_PORT", "8090"))
+API_KEY = os.getenv("SENSEFACE_API_KEY", "")
+LOCK = threading.Lock()
+ATT_RE = re.compile(r"^(?:PIN=)?([^\t]+)\t(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\t([^\t]*)(?:\t([^\t]*))?(?:\t([^\t]*))?(?:\t([^\t]*))?")
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def db():
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=FULL")
+    con.execute("PRAGMA busy_timeout=30000")
+    return con
+
+
+def initialize():
+    with db() as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS devices(
+          serial_number TEXT PRIMARY KEY, ip TEXT, firmware TEXT,
+          first_seen TEXT NOT NULL, last_seen TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS raw_requests(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, request_hash TEXT UNIQUE NOT NULL,
+          serial_number TEXT NOT NULL, table_name TEXT, query_string TEXT,
+          body BLOB NOT NULL, received_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS attendance(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, event_key TEXT UNIQUE NOT NULL,
+          serial_number TEXT NOT NULL, employee_id TEXT NOT NULL,
+          event_time TEXT NOT NULL, status TEXT, verify_mode TEXT,
+          work_code TEXT, reserved TEXT, raw_line TEXT NOT NULL,
+          received_at TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS attendance_time_idx ON attendance(event_time);
+        CREATE INDEX IF NOT EXISTS attendance_employee_idx ON attendance(employee_id);
+        CREATE INDEX IF NOT EXISTS attendance_device_idx ON attendance(serial_number);
+        """)
+
+
+def save_push(sn, table, query, body, remote_ip):
+    received = now()
+    request_hash = hashlib.sha256(sn.encode() + b"\0" + query.encode() + b"\0" + body).hexdigest()
+    text = body.decode("utf-8", "replace")
+    inserted = 0
+    with LOCK, db() as con:
+        con.execute("""INSERT INTO devices(serial_number,ip,first_seen,last_seen)
+          VALUES(?,?,?,?) ON CONFLICT(serial_number) DO UPDATE SET
+          ip=excluded.ip,last_seen=excluded.last_seen""", (sn, remote_ip, received, received))
+        con.execute("""INSERT OR IGNORE INTO raw_requests
+          (request_hash,serial_number,table_name,query_string,body,received_at)
+          VALUES(?,?,?,?,?,?)""", (request_hash, sn, table, query, body, received))
+        if table == "ATTLOG" or not table:
+            for line in text.splitlines():
+                match = ATT_RE.match(line.strip())
+                if not match:
+                    continue
+                employee, event_time, status, verify, work, reserved = match.groups()
+                event_key = hashlib.sha256((sn + "\0" + line.strip()).encode()).hexdigest()
+                cur = con.execute("""INSERT OR IGNORE INTO attendance
+                  (event_key,serial_number,employee_id,event_time,status,verify_mode,
+                   work_code,reserved,raw_line,received_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                  (event_key, sn, employee, event_time, status or "", verify or "",
+                   work or "", reserved or "", line.strip(), received))
+                inserted += cur.rowcount
+    return inserted
+
+
+def rows_json(rows):
+    return [dict(row) for row in rows]
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "SenseFaceHRMS/1.0"
+
+    def log_message(self, fmt, *args):
+        print(f"{now()} {self.client_address[0]} {fmt % args}", flush=True)
+
+    def send(self, status=200, body=b"OK", content_type="text/plain; charset=utf-8"):
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def json(self, value, status=200):
+        self.send(status, json.dumps(value, ensure_ascii=False, default=str).encode(), "application/json; charset=utf-8")
+
+    def authorized(self):
+        return not API_KEY or self.headers.get("X-API-Key") == API_KEY
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.end_headers()
+
+    def do_GET(self):
+        uri = urlparse(self.path)
+        q = parse_qs(uri.query)
+        sn = q.get("SN", ["UNKNOWN"])[0]
+        if uri.path == "/iclock/cdata":
+            stamp = "0"
+            reply = "\n".join([
+                f"GET OPTION FROM: {sn}", f"ATTLOGStamp={stamp}", "OPERLOGStamp=0",
+                "ATTPHOTOStamp=0", "ErrorDelay=60", "Delay=10",
+                "TransTimes=00:00", "TransInterval=1",
+                "TransFlag=TransData AttLog OpLog", "TimeZone=6",
+                "Realtime=1", "Encrypt=0", "PushProtVer=2.4.1", ""
+            ])
+            self.send(body=reply)
+        elif uri.path == "/iclock/getrequest":
+            self.send(body="\n")
+        elif uri.path == "/health":
+            with db() as con:
+                count = con.execute("SELECT COUNT(*) FROM attendance").fetchone()[0]
+                devices = rows_json(con.execute("SELECT * FROM devices ORDER BY last_seen DESC").fetchall())
+            self.json({"status": "ok", "attendance_count": count, "devices": devices})
+        elif uri.path in ("/api/v1/attendance", "/api/v1/attendance.csv"):
+            if not self.authorized():
+                return self.json({"error": "unauthorized"}, 401)
+            self.attendance(uri, q)
+        else:
+            self.json({"error": "not_found"}, 404)
+
+    def attendance(self, uri, q):
+        limit = min(max(int(q.get("limit", ["100"])[0]), 1), 10000)
+        after_id = max(int(q.get("after_id", ["0"])[0]), 0)
+        clauses, args = ["id > ?"], [after_id]
+        for key, column in (("employee_id", "employee_id"), ("serial_number", "serial_number")):
+            if q.get(key):
+                clauses.append(f"{column} = ?")
+                args.append(q[key][0])
+        if q.get("from"):
+            clauses.append("event_time >= ?"); args.append(q["from"][0])
+        if q.get("to"):
+            clauses.append("event_time <= ?"); args.append(q["to"][0])
+        sql = "SELECT * FROM attendance WHERE " + " AND ".join(clauses) + " ORDER BY id LIMIT ?"
+        with db() as con:
+            records = rows_json(con.execute(sql, args + [limit]).fetchall())
+        if uri.path.endswith(".csv"):
+            output = io.StringIO()
+            fields = list(records[0]) if records else ["id","serial_number","employee_id","event_time","status","verify_mode","work_code"]
+            writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader(); writer.writerows(records)
+            self.send(body=output.getvalue(), content_type="text/csv; charset=utf-8")
+        else:
+            self.json({"count": len(records), "next_after_id": records[-1]["id"] if records else after_id, "data": records})
+
+    def do_POST(self):
+        uri = urlparse(self.path)
+        q = parse_qs(uri.query)
+        if uri.path not in ("/iclock/cdata", "/iclock/devicecmd", "/iclock/registry"):
+            return self.json({"error": "not_found"}, 404)
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length)
+        sn = q.get("SN", q.get("sn", ["UNKNOWN"]))[0]
+        table = q.get("table", [""])[0].upper()
+        inserted = save_push(sn, table, uri.query, body, self.client_address[0])
+        self.send(body=f"OK: {inserted}" if inserted else "OK")
+
+
+def main():
+    initialize()
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"SenseFace HRMS Bridge listening on http://{HOST}:{PORT}")
+    print(f"Database: {DB_PATH}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
