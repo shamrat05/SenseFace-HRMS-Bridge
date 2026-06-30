@@ -26,6 +26,7 @@ API_KEY = os.getenv("SENSEFACE_API_KEY", "")
 TIMEZONE_NAME = os.getenv("SENSEFACE_TIMEZONE", "Asia/Dhaka")
 CLOCK_MAX_SKEW = max(int(os.getenv("SENSEFACE_CLOCK_MAX_SKEW", "300")), 0)
 LOCK = threading.Lock()
+USER_SYNC_REQUESTED = set()
 ATT_RE = re.compile(r"^(?:PIN=)?([^\t]+)\t(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\t([^\t]*)(?:\t([^\t]*))?(?:\t([^\t]*))?(?:\t([^\t]*))?")
 USER_RE = re.compile(r"^(?:USER\s+)?PIN=([^\t]+)\t(.*)$")
 
@@ -225,16 +226,29 @@ class Handler(BaseHTTPRequestHandler):
             ])
             self.send(body=reply)
         elif uri.path == "/iclock/getrequest":
-            self.send(body="\n")
+            with LOCK, db() as con:
+                missing = con.execute("""SELECT COUNT(*) FROM employees
+                  WHERE serial_number=? AND raw_line='DISCOVERED_FROM_ATTENDANCE'""",
+                  (sn,)).fetchone()[0]
+                if missing and sn not in USER_SYNC_REQUESTED:
+                    USER_SYNC_REQUESTED.add(sn)
+                    command_id = int(datetime.now(timezone.utc).timestamp())
+                    reply = f"C:{command_id}:DATA QUERY USERINFO\n"
+                else:
+                    reply = "\n"
+            self.send(body=reply)
         elif uri.path == "/health":
             with db() as con:
                 count = con.execute("SELECT COUNT(*) FROM attendance").fetchone()[0]
                 suspicious = con.execute("""SELECT COUNT(*) FROM attendance
                   WHERE time_status != 'ok'""").fetchone()[0]
+                missing_names = con.execute("""SELECT COUNT(*) FROM employees
+                  WHERE raw_line='DISCOVERED_FROM_ATTENDANCE'""").fetchone()[0]
                 devices = rows_json(con.execute("SELECT * FROM devices ORDER BY last_seen DESC").fetchall())
             self.json({"status": "ok", "server_time": device_now(),
                        "timezone": TIMEZONE_NAME, "attendance_count": count,
-                       "suspicious_time_count": suspicious, "devices": devices})
+                       "suspicious_time_count": suspicious,
+                       "employees_pending_device_sync": missing_names, "devices": devices})
         elif uri.path in ("/api/v1/attendance", "/api/v1/attendance.csv"):
             if not self.authorized():
                 return self.json({"error": "unauthorized"}, 401)

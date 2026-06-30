@@ -114,6 +114,10 @@ $env:SENSEFACE_CLOCK_MAX_SKEW = '300'
 returns `delivery_delay_seconds` and `time_status`, allowing the HRMS to quarantine
 suspicious records instead of silently accepting a bad device clock.
 
+When attendance arrives before its USER record, the bridge creates an employee
+placeholder and requests a full `USERINFO` migration from the terminal. USER data
+subsequently replaces the placeholder and backfills `employee_name` on attendance.
+
 ## Employee directory
 
 Endpoint: GET /api/v1/employees
