@@ -10,10 +10,12 @@ import re
 import signal
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -22,13 +24,45 @@ DB_PATH = DATA / "senseface_hrms.db"
 HOST = os.getenv("SENSEFACE_HOST", "0.0.0.0")
 PORT = int(os.getenv("SENSEFACE_PORT", "8090"))
 API_KEY = os.getenv("SENSEFACE_API_KEY", "")
+TIMEZONE_NAME = os.getenv("SENSEFACE_TIMEZONE", "Asia/Dhaka")
+CLOCK_SYNC_INTERVAL = max(int(os.getenv("SENSEFACE_CLOCK_SYNC_INTERVAL", "3600")), 60)
+CLOCK_MAX_SKEW = max(int(os.getenv("SENSEFACE_CLOCK_MAX_SKEW", "300")), 0)
 LOCK = threading.Lock()
+LAST_TIME_SYNC = {}
 ATT_RE = re.compile(r"^(?:PIN=)?([^\t]+)\t(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\t([^\t]*)(?:\t([^\t]*))?(?:\t([^\t]*))?(?:\t([^\t]*))?")
 USER_RE = re.compile(r"^(?:USER\s+)?PIN=([^\t]+)\t(.*)$")
 
 
+try:
+    LOCAL_TZ = ZoneInfo(TIMEZONE_NAME)
+except ZoneInfoNotFoundError as exc:
+    raise SystemExit(f"Unknown SENSEFACE_TIMEZONE: {TIMEZONE_NAME}") from exc
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def device_now():
+    """Current wall-clock value expected by the attendance terminal."""
+    return datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def timezone_hours():
+    offset = datetime.now(LOCAL_TZ).utcoffset()
+    return int(offset.total_seconds() // 3600) if offset else 0
+
+
+def timestamp_diagnostics(event_time, received_at):
+    """Compare the device's naive local timestamp with server local time."""
+    try:
+        event = datetime.strptime(event_time, "%Y-%m-%d %H:%M:%S").replace(tzinfo=LOCAL_TZ)
+        received = datetime.fromisoformat(received_at).astimezone(LOCAL_TZ)
+        difference = round((received - event).total_seconds())
+        status = "ok" if abs(difference) <= CLOCK_MAX_SKEW else "delayed_or_clock_skew"
+        return difference, status
+    except ValueError:
+        return None, "invalid_device_time"
 
 
 def db():
@@ -65,6 +99,17 @@ def initialize():
         CREATE INDEX IF NOT EXISTS attendance_employee_idx ON attendance(employee_id);
         CREATE INDEX IF NOT EXISTS attendance_device_idx ON attendance(serial_number);
         """)
+        columns = {row[1] for row in con.execute("PRAGMA table_info(attendance)")}
+        if "delivery_delay_seconds" not in columns:
+            con.execute("ALTER TABLE attendance ADD COLUMN delivery_delay_seconds INTEGER")
+        if "time_status" not in columns:
+            con.execute("ALTER TABLE attendance ADD COLUMN time_status TEXT NOT NULL DEFAULT 'unknown'")
+        pending = con.execute("""SELECT id,event_time,received_at FROM attendance
+          WHERE time_status = 'unknown' OR delivery_delay_seconds IS NULL""").fetchall()
+        for row in pending:
+            delay_seconds, time_status = timestamp_diagnostics(row[1], row[2])
+            con.execute("""UPDATE attendance SET delivery_delay_seconds=?,time_status=?
+              WHERE id=?""", (delay_seconds, time_status, row[0]))
 
 
 def save_push(sn, table, query, body, remote_ip):
@@ -85,12 +130,15 @@ def save_push(sn, table, query, body, remote_ip):
                 if not match:
                     continue
                 employee, event_time, status, verify, work, reserved = match.groups()
+                delay_seconds, time_status = timestamp_diagnostics(event_time, received)
                 event_key = hashlib.sha256((sn + "\0" + line.strip()).encode()).hexdigest()
                 cur = con.execute("""INSERT OR IGNORE INTO attendance
                   (event_key,serial_number,employee_id,event_time,status,verify_mode,
-                   work_code,reserved,raw_line,received_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                   work_code,reserved,raw_line,received_at,delivery_delay_seconds,time_status)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                   (event_key, sn, employee, event_time, status or "", verify or "",
-                   work or "", reserved or "", line.strip(), received))
+                   work or "", reserved or "", line.strip(), received,
+                   delay_seconds, time_status))
                 inserted += cur.rowcount
         for line in text.splitlines():
             match = USER_RE.match(line.strip())
@@ -156,17 +204,31 @@ class Handler(BaseHTTPRequestHandler):
                 f"GET OPTION FROM: {sn}", f"ATTLOGStamp={stamp}", "OPERLOGStamp=0",
                 "ATTPHOTOStamp=0", "ErrorDelay=60", "Delay=10",
                 "TransTimes=00:00", "TransInterval=1",
-                "TransFlag=TransData AttLog OpLog", "TimeZone=6",
+                "TransFlag=TransData AttLog OpLog", f"TimeZone={timezone_hours()}",
+                f"DateTime={device_now()}",
                 "Realtime=1", "Encrypt=0", "PushProtVer=2.4.1", ""
             ])
             self.send(body=reply)
         elif uri.path == "/iclock/getrequest":
-            self.send(body="\n")
+            current = time.monotonic()
+            with LOCK:
+                last_sync = LAST_TIME_SYNC.get(sn, 0)
+                if current - last_sync >= CLOCK_SYNC_INTERVAL:
+                    LAST_TIME_SYNC[sn] = current
+                    command_id = int(time.time())
+                    reply = f"C:{command_id}:DATA UPDATE options DateTime={device_now()}\n"
+                else:
+                    reply = "\n"
+            self.send(body=reply)
         elif uri.path == "/health":
             with db() as con:
                 count = con.execute("SELECT COUNT(*) FROM attendance").fetchone()[0]
+                suspicious = con.execute("""SELECT COUNT(*) FROM attendance
+                  WHERE time_status != 'ok'""").fetchone()[0]
                 devices = rows_json(con.execute("SELECT * FROM devices ORDER BY last_seen DESC").fetchall())
-            self.json({"status": "ok", "attendance_count": count, "devices": devices})
+            self.json({"status": "ok", "server_time": device_now(),
+                       "timezone": TIMEZONE_NAME, "attendance_count": count,
+                       "suspicious_time_count": suspicious, "devices": devices})
         elif uri.path in ("/api/v1/attendance", "/api/v1/attendance.csv"):
             if not self.authorized():
                 return self.json({"error": "unauthorized"}, 401)

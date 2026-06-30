@@ -17,6 +17,10 @@ This project is a standalone T&A Push/ADMS HTTP receiver for SenseFace 2A and co
 
 Keep this PC's LAN address static or reserve it in the router.
 
+Set the terminal's timezone to UTC+06:00 (Dhaka) and enable its automatic time
+synchronization. The bridge also supplies its local time during ADMS registration
+and sends an hourly clock-sync command while the terminal is connected.
+
 ## Run
 
 1. Close CVAccess and any previous ADMS receiver using port 8090.
@@ -32,6 +36,9 @@ Windows Firewall must allow inbound TCP 8090. The existing `SenseFace_ADMS_8090`
 - SQLite uses WAL mode, full synchronization, and a 30-second busy timeout.
 - Re-sent device requests and attendance events are deduplicated by SHA-256 keys.
 - Existing records are never cleared by the server.
+- `time_status` is `ok` when device time and receipt time are within five minutes;
+  otherwise it is `delayed_or_clock_skew`. A delayed offline upload is not
+  automatically rewritten because receipt time is not the original punch time.
 - Back up the complete `data` directory while the server is stopped, or use SQLite's backup API while running.
 
 ## REST API
@@ -94,6 +101,20 @@ $env:SENSEFACE_API_KEY = 'replace-with-a-long-random-value'
 ```
 
 Do not expose port 8090 directly to the public internet. Put an authenticated HTTPS reverse proxy or VPN in front if remote access is required.
+
+## Clock configuration
+
+The defaults are suitable for Bangladesh:
+
+```powershell
+$env:SENSEFACE_TIMEZONE = 'Asia/Dhaka'
+$env:SENSEFACE_CLOCK_SYNC_INTERVAL = '3600'
+$env:SENSEFACE_CLOCK_MAX_SKEW = '300'
+```
+
+`event_time` remains the timestamp recorded by the terminal. The API additionally
+returns `delivery_delay_seconds` and `time_status`, allowing the HRMS to quarantine
+suspicious records instead of silently accepting a bad device clock.
 
 ## Employee directory
 
