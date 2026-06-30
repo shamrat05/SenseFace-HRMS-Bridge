@@ -124,3 +124,16 @@ Endpoint: GET /api/v1/employees
 
 Employee names are stored in the employees table. Attendance JSON includes employee_name when the device has pushed the corresponding USER record.
 
+## Timezone note
+
+The time differences in the data are intentional, not timing bugs:
+
+- `event_time` — device-local Bangladesh time, e.g. `13:46:45`
+- `received_at` — server UTC (+00:00), e.g. `07:46:46`
+
+07:46 UTC + 6 hours = 13:46 Bangladesh time. The two values are consistent once you account for the offset.
+
+Similarly, `updated_at` on employee records stores when the server received/synchronised the data (UTC), not the employee creation time.
+
+UTC storage is safer for databases, but the different formats can be confusing. The HRMS UI should convert `received_at` and `updated_at` to `Asia/Dhaka` before displaying them.
+
