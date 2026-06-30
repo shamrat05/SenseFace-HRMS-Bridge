@@ -10,7 +10,6 @@ import re
 import signal
 import sqlite3
 import threading
-import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,10 +24,8 @@ HOST = os.getenv("SENSEFACE_HOST", "0.0.0.0")
 PORT = int(os.getenv("SENSEFACE_PORT", "8090"))
 API_KEY = os.getenv("SENSEFACE_API_KEY", "")
 TIMEZONE_NAME = os.getenv("SENSEFACE_TIMEZONE", "Asia/Dhaka")
-CLOCK_SYNC_INTERVAL = max(int(os.getenv("SENSEFACE_CLOCK_SYNC_INTERVAL", "3600")), 60)
 CLOCK_MAX_SKEW = max(int(os.getenv("SENSEFACE_CLOCK_MAX_SKEW", "300")), 0)
 LOCK = threading.Lock()
-LAST_TIME_SYNC = {}
 ATT_RE = re.compile(r"^(?:PIN=)?([^\t]+)\t(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\t([^\t]*)(?:\t([^\t]*))?(?:\t([^\t]*))?(?:\t([^\t]*))?")
 USER_RE = re.compile(r"^(?:USER\s+)?PIN=([^\t]+)\t(.*)$")
 
@@ -104,6 +101,15 @@ def initialize():
             con.execute("ALTER TABLE attendance ADD COLUMN delivery_delay_seconds INTEGER")
         if "time_status" not in columns:
             con.execute("ALTER TABLE attendance ADD COLUMN time_status TEXT NOT NULL DEFAULT 'unknown'")
+        if "employee_name" not in columns:
+            con.execute("ALTER TABLE attendance ADD COLUMN employee_name TEXT NOT NULL DEFAULT ''")
+        con.execute("""INSERT OR IGNORE INTO employees
+          (serial_number,employee_id,name,privilege,card,raw_line,updated_at)
+          SELECT serial_number,employee_id,'','','','DISCOVERED_FROM_ATTENDANCE',MIN(received_at)
+          FROM attendance GROUP BY serial_number,employee_id""")
+        con.execute("""UPDATE attendance SET employee_name=COALESCE((
+          SELECT name FROM employees e WHERE e.serial_number=attendance.serial_number
+          AND e.employee_id=attendance.employee_id), '')""")
         pending = con.execute("""SELECT id,event_time,received_at FROM attendance
           WHERE time_status = 'unknown' OR delivery_delay_seconds IS NULL""").fetchall()
         for row in pending:
@@ -131,14 +137,20 @@ def save_push(sn, table, query, body, remote_ip):
                     continue
                 employee, event_time, status, verify, work, reserved = match.groups()
                 delay_seconds, time_status = timestamp_diagnostics(event_time, received)
+                con.execute("""INSERT OR IGNORE INTO employees
+                  (serial_number,employee_id,name,privilege,card,raw_line,updated_at)
+                  VALUES(?,?,?,?,?,?,?)""",
+                  (sn, employee, "", "", "", "DISCOVERED_FROM_ATTENDANCE", received))
+                employee_name = con.execute("""SELECT name FROM employees
+                  WHERE serial_number=? AND employee_id=?""", (sn, employee)).fetchone()[0]
                 event_key = hashlib.sha256((sn + "\0" + line.strip()).encode()).hexdigest()
                 cur = con.execute("""INSERT OR IGNORE INTO attendance
                   (event_key,serial_number,employee_id,event_time,status,verify_mode,
-                   work_code,reserved,raw_line,received_at,delivery_delay_seconds,time_status)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   work_code,reserved,raw_line,received_at,delivery_delay_seconds,time_status,
+                   employee_name) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                   (event_key, sn, employee, event_time, status or "", verify or "",
                    work or "", reserved or "", line.strip(), received,
-                   delay_seconds, time_status))
+                   delay_seconds, time_status, employee_name))
                 inserted += cur.rowcount
         for line in text.splitlines():
             match = USER_RE.match(line.strip())
@@ -157,6 +169,9 @@ def save_push(sn, table, query, body, remote_ip):
               raw_line=excluded.raw_line,updated_at=excluded.updated_at""",
               (sn, employee_id, fields.get("Name", ""), fields.get("Pri", ""),
                fields.get("Card", ""), line.strip(), received))
+            con.execute("""UPDATE attendance SET employee_name=?
+              WHERE serial_number=? AND employee_id=?""",
+              (fields.get("Name", ""), sn, employee_id))
     return inserted
 
 
@@ -204,22 +219,13 @@ class Handler(BaseHTTPRequestHandler):
                 f"GET OPTION FROM: {sn}", f"ATTLOGStamp={stamp}", "OPERLOGStamp=0",
                 "ATTPHOTOStamp=0", "ErrorDelay=60", "Delay=10",
                 "TransTimes=00:00", "TransInterval=1",
-                "TransFlag=TransData AttLog OpLog", f"TimeZone={timezone_hours()}",
+                "TransFlag=TransData AttLog OpLog EnrollUser ChgUser", f"TimeZone={timezone_hours()}",
                 f"DateTime={device_now()}",
                 "Realtime=1", "Encrypt=0", "PushProtVer=2.4.1", ""
             ])
             self.send(body=reply)
         elif uri.path == "/iclock/getrequest":
-            current = time.monotonic()
-            with LOCK:
-                last_sync = LAST_TIME_SYNC.get(sn, 0)
-                if current - last_sync >= CLOCK_SYNC_INTERVAL:
-                    LAST_TIME_SYNC[sn] = current
-                    command_id = int(time.time())
-                    reply = f"C:{command_id}:DATA UPDATE options DateTime={device_now()}\n"
-                else:
-                    reply = "\n"
-            self.send(body=reply)
+            self.send(body="\n")
         elif uri.path == "/health":
             with db() as con:
                 count = con.execute("SELECT COUNT(*) FROM attendance").fetchone()[0]
@@ -257,8 +263,7 @@ class Handler(BaseHTTPRequestHandler):
         if q.get("to"):
             clauses.append("event_time <= ?"); args.append(q["to"][0])
         qualified = [clause.replace("id >", "a.id >").replace("event_time", "a.event_time").replace("employee_id", "a.employee_id").replace("serial_number", "a.serial_number") for clause in clauses]
-        sql = """SELECT a.*, e.name AS employee_name FROM attendance a
-          LEFT JOIN employees e ON e.serial_number=a.serial_number AND e.employee_id=a.employee_id
+        sql = """SELECT a.* FROM attendance a
           WHERE """ + " AND ".join(qualified) + " ORDER BY a.id LIMIT ?"
         with db() as con:
             records = rows_json(con.execute(sql, args + [limit]).fetchall())

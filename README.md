@@ -18,8 +18,7 @@ This project is a standalone T&A Push/ADMS HTTP receiver for SenseFace 2A and co
 Keep this PC's LAN address static or reserve it in the router.
 
 Set the terminal's timezone to UTC+06:00 (Dhaka) and enable its automatic time
-synchronization. The bridge also supplies its local time during ADMS registration
-and sends an hourly clock-sync command while the terminal is connected.
+synchronization. The bridge also supplies its local time during ADMS registration.
 
 ## Run
 
@@ -108,7 +107,6 @@ The defaults are suitable for Bangladesh:
 
 ```powershell
 $env:SENSEFACE_TIMEZONE = 'Asia/Dhaka'
-$env:SENSEFACE_CLOCK_SYNC_INTERVAL = '3600'
 $env:SENSEFACE_CLOCK_MAX_SKEW = '300'
 ```
 
