@@ -17,11 +17,11 @@ from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "data"
-DATA.mkdir(exist_ok=True)
+DATA = Path(os.getenv("SENSEFACE_DATA_DIR", str(ROOT / "data"))).expanduser().resolve()
+DATA.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA / "senseface_hrms.db"
 HOST = os.getenv("SENSEFACE_HOST", "0.0.0.0")
-PORT = int(os.getenv("SENSEFACE_PORT", "8090"))
+PORT = int(os.getenv("SENSEFACE_PORT", os.getenv("PORT", "8090")))
 API_KEY = os.getenv("SENSEFACE_API_KEY", "")
 TIMEZONE_NAME = os.getenv("SENSEFACE_TIMEZONE", "Asia/Dhaka")
 CLOCK_MAX_SKEW = max(int(os.getenv("SENSEFACE_CLOCK_MAX_SKEW", "300")), 0)
@@ -249,6 +249,9 @@ class Handler(BaseHTTPRequestHandler):
                        "timezone": TIMEZONE_NAME, "attendance_count": count,
                        "suspicious_time_count": suspicious,
                        "employees_pending_device_sync": missing_names, "devices": devices})
+        elif uri.path == "/":
+            self.json({"service": "SenseFace HRMS Bridge", "status": "ok",
+                       "health": "/health", "attendance": "/api/v1/attendance"})
         elif uri.path in ("/api/v1/attendance", "/api/v1/attendance.csv"):
             if not self.authorized():
                 return self.json({"error": "unauthorized"}, 401)

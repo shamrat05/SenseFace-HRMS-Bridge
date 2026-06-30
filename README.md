@@ -29,6 +29,52 @@ synchronization. The bridge also supplies its local time during ADMS registratio
 
 Windows Firewall must allow inbound TCP 8090. The existing `SenseFace_ADMS_8090` rule can be retained.
 
+## Cloud hosting
+
+The bridge supports cloud platforms that provide a public HTTP endpoint and
+forward requests to the application's internal port. It reads the standard
+`PORT` environment variable used by Railway, Render and similar platforms.
+`SENSEFACE_PORT` takes precedence when explicitly configured.
+
+Required hosting configuration:
+
+- Start command: `python -u server.py`
+- Bind address: `0.0.0.0` (the default)
+- Health check path: `/health`
+- Persistent storage mounted at the application's `data` directory, or set
+  `SENSEFACE_DATA_DIR` to the persistent mount path
+- One running replica when using SQLite
+
+### Railway
+
+1. Deploy the GitHub repository and generate a Public Networking domain.
+2. Let Railway provide `PORT`, or set the domain target port to `8090` when
+   explicitly setting `SENSEFACE_PORT=8090`.
+3. Attach a volume mounted at `/app/data`. Without it, SQLite records are lost
+   on redeploy.
+4. Set `SENSEFACE_TIMEZONE=Asia/Dhaka` and a strong `SENSEFACE_API_KEY`.
+5. Confirm `https://YOUR-DOMAIN/health` returns `status: ok`.
+
+For a SenseFace domain-mode screen that has no port field, configure:
+
+- Domain name: enabled
+- Server address: the hostname only, such as
+  `senseface-hrms-bridge-production.up.railway.app`
+- Do not enter `http://`, `https://`, a path, or a trailing slash
+- Proxy: disabled
+
+With no port field the terminal normally uses HTTP port 80. The cloud ingress
+must accept plain HTTP on port 80 and forward it to the application; a mandatory
+HTTP-to-HTTPS redirect may not be followed by the terminal firmware. This cannot
+be repaired inside the Python application because a rejected or redirected
+request never reaches it. If the terminal provides HTTPS, enable it and use the
+platform's HTTPS endpoint. If it provides a configurable port, Railway TCP Proxy
+can instead forward a generated public port to the internal application port.
+
+Successful device connection appears in logs as requests to
+`/iclock/cdata` and `/iclock/getrequest`. Browser requests to `/health` only prove
+the web service is reachable; they do not prove the terminal has connected.
+
 ## Data-safety behavior
 
 - Every raw device POST is committed to SQLite before success is returned.
