@@ -1,100 +1,202 @@
 # SenseFace HRMS Bridge
 
-ZKTeco network attendance devices use two main communication models:
+Standalone HTTP receiver for ZKTeco SenseFace 2A and compatible T&A Push/ADMS
+terminals. It receives attendance and employee records, stores them in SQLite,
+and exposes JSON and CSV APIs for HRMS integration.
 
-- **Pull devices:** Mostly older terminals. HR software connects to the device—commonly on port 4370—and downloads records.
-- **Push devices:** Modern terminals such as **SenseFace 2A**. The device sends attendance records by HTTP to a configured server; port-4370 pull libraries do not work with this mode.
+No ZKTeco desktop software, Python package, or cloud service is required.
 
-This project is a standalone T&A Push/ADMS HTTP receiver for SenseFace 2A and compatible ZKTeco push devices. It stores incoming records in SQLite and exposes them through JSON and CSV APIs for HRMS integration. It requires no CVAccess, Node package, Python package, or cloud service.
+## How it works
 
-## Device configuration
+```text
+SenseFace 2A --T&A Push/ADMS--> Bridge --JSON/CSV API--> HRMS
+                                      |
+                                      +--> SQLite
+```
 
-- Device Type: `T&A Push`
-- Server Mode: `ADMS`
-- Server Address: `192.168.0.101` (this PC)
-- Server Port: `8090`
-- Domain and proxy: disabled
+The terminal pushes records to the bridge. This is different from older ZKTeco
+devices that are queried through port 4370.
 
-Keep this PC's LAN address static or reserve it in the router.
+## Choose a deployment
 
-Set the terminal's timezone to UTC+06:00 (Dhaka) and enable its automatic time
-synchronization. The bridge also supplies its local time during ADMS registration.
+- **Railway:** easiest public deployment; configure the terminal with Railway's
+  domain and enable HTTPS.
+- **VPS:** use a public IP and port, or place the bridge behind an HTTPS reverse
+  proxy.
+- **Local PC:** suitable when the terminal and computer share the same LAN.
 
-## Run
+Only run one bridge replica when using SQLite.
 
-1. Close CVAccess and any previous ADMS receiver using port 8090.
-2. Double-click `Start-SenseFace-Bridge.bat`.
-3. Keep the window open. The SQLite database is created automatically at `data/senseface_hrms.db`.
-4. Check `http://127.0.0.1:8090/health`.
+## Railway setup
 
-Windows Firewall must allow inbound TCP 8090. The existing `SenseFace_ADMS_8090` rule can be retained.
+1. Deploy this GitHub repository as a Railway service.
+2. Use this start command:
 
-## Cloud hosting
+   ```text
+   python -u server.py
+   ```
 
-The bridge supports cloud platforms that provide a public HTTP endpoint and
-forward requests to the application's internal port. It reads the standard
-`PORT` environment variable used by Railway, Render and similar platforms.
-`SENSEFACE_PORT` takes precedence when explicitly configured.
+3. Generate a domain under **Settings > Networking > Public Networking**.
+4. Attach a persistent volume mounted at:
 
-Required hosting configuration:
+   ```text
+   /app/data
+   ```
 
-- Start command: `python -u server.py`
-- Bind address: `0.0.0.0` (the default)
-- Health check path: `/health`
-- Persistent storage mounted at the application's `data` directory, or set
-  `SENSEFACE_DATA_DIR` to the persistent mount path
-- One running replica when using SQLite
+   This is required. Without the volume, redeployment can erase the SQLite
+   database.
 
-### Railway
+5. Add these service variables:
 
-1. Deploy the GitHub repository and generate a Public Networking domain.
-2. Let Railway provide `PORT`, or set the domain target port to `8090` when
-   explicitly setting `SENSEFACE_PORT=8090`.
-3. Attach a volume mounted at `/app/data`. Without it, SQLite records are lost
-   on redeploy.
-4. Set `SENSEFACE_TIMEZONE=Asia/Dhaka` and a strong `SENSEFACE_API_KEY`.
-5. Confirm `https://YOUR-DOMAIN/health` returns `status: ok`.
+   ```text
+   SENSEFACE_TIMEZONE=Asia/Dhaka
+   SENSEFACE_API_KEY=replace-with-a-long-random-secret
+   ```
 
-For a SenseFace domain-mode screen that has no port field, configure:
+   The bridge automatically reads Railway's `PORT` variable. Do not expose the
+   container's internal port directly.
 
-- Domain name: enabled
-- Server address: the hostname only, such as
-  `senseface-hrms-bridge-production.up.railway.app`
-- Do not enter `http://`, `https://`, a path, or a trailing slash
-- Proxy: disabled
+6. Confirm this URL returns `"status": "ok"`:
 
-With no port field the terminal normally uses HTTP port 80. The cloud ingress
-must accept plain HTTP on port 80 and forward it to the application; a mandatory
-HTTP-to-HTTPS redirect may not be followed by the terminal firmware. This cannot
-be repaired inside the Python application because a rejected or redirected
-request never reaches it. If the terminal provides HTTPS, enable it and use the
-platform's HTTPS endpoint. If it provides a configurable port, Railway TCP Proxy
-can instead forward a generated public port to the internal application port.
+   ```text
+   https://YOUR-SERVICE.up.railway.app/health
+   ```
 
-Successful device connection appears in logs as requests to
-`/iclock/cdata` and `/iclock/getrequest`. Browser requests to `/health` only prove
-the web service is reachable; they do not prove the terminal has connected.
+### SenseFace 2A settings for Railway
 
-## Data-safety behavior
+Open the terminal's **Cloud Server Settings** and configure:
 
-- Every raw device POST is committed to SQLite before success is returned.
-- SQLite uses WAL mode, full synchronization, and a 30-second busy timeout.
-- Re-sent device requests and attendance events are deduplicated by SHA-256 keys.
-- Existing records are never cleared by the server.
-- `time_status` is `ok` when device time and receipt time are within five minutes;
-  otherwise it is `delayed_or_clock_skew`. A delayed offline upload is not
-  automatically rewritten because receipt time is not the original punch time.
-- Back up the complete `data` directory while the server is stopped, or use SQLite's backup API while running.
+```text
+Server/Protocol mode: T&A Push / ADMS
+Enable domain name:   Yes
+Server address:       YOUR-SERVICE.up.railway.app
+Enable HTTPS:         Yes
+Proxy:                Disabled
+```
 
-## REST API
+Enter only the hostname. Do not include `https://`, a port, `/health`, or a
+trailing slash. Railway uses HTTPS port 443 automatically.
+
+Save the settings and restart the terminal. Within about one minute, Railway
+logs should contain requests such as:
+
+```text
+GET  /iclock/cdata?SN=...
+GET  /iclock/getrequest?SN=...
+POST /iclock/cdata?SN=...
+```
+
+Railway redirects plain HTTP to HTTPS, so **HTTPS must be enabled on the
+terminal**. Browser `/health` requests alone do not prove the terminal connected.
+
+## VPS setup
+
+Requirements:
+
+- Python 3.9 or newer
+- A static public IP or domain
+- Persistent disk storage
+- Firewall access to the selected port
+
+Run the bridge:
+
+```bash
+export SENSEFACE_TIMEZONE=Asia/Dhaka
+export SENSEFACE_API_KEY='replace-with-a-long-random-secret'
+export SENSEFACE_PORT=8090
+python -u server.py
+```
+
+For production, run it through systemd, Docker, or another process supervisor.
+Back up the `data` directory.
+
+### Direct VPS IP and port
+
+Allow inbound TCP port 8090, then configure the terminal:
+
+```text
+Server/Protocol mode: T&A Push / ADMS
+Enable domain name:   No
+Server address:       YOUR_PUBLIC_IP
+Server port:          8090
+Enable HTTPS:         No
+Proxy:                Disabled
+```
+
+Do not use this option if the public network is untrusted. Prefer HTTPS through
+a domain and reverse proxy.
+
+### VPS domain with HTTPS
+
+Point a domain to the VPS and configure Nginx, Caddy, or another reverse proxy to
+terminate HTTPS and forward requests to `http://127.0.0.1:8090`. Then use:
+
+```text
+Enable domain name:   Yes
+Server address:       attendance.example.com
+Enable HTTPS:         Yes
+Proxy:                Disabled
+```
+
+The reverse proxy must preserve request methods, query strings, and POST bodies.
+
+## Local Windows setup
+
+1. Reserve a static LAN IP for the computer.
+2. Allow inbound TCP 8090 in Windows Firewall.
+3. Close other ADMS receivers using port 8090.
+4. Run `Start-SenseFace-Bridge.bat`.
+5. Open `http://127.0.0.1:8090/health`.
+
+Configure the terminal:
+
+```text
+Server/Protocol mode: T&A Push / ADMS
+Enable domain name:   No
+Server address:       COMPUTER_LAN_IP
+Server port:          8090
+Enable HTTPS:         No
+Proxy:                Disabled
+```
+
+The terminal and computer must be able to reach each other on the LAN.
+
+## Verify the connection
+
+Open:
+
+```text
+GET /health
+```
+
+After the terminal connects, `devices` should contain its serial number. Make a
+test punch, then open:
+
+```text
+GET /api/v1/attendance?after_id=0&limit=100
+```
+
+If `SENSEFACE_API_KEY` is configured, include:
+
+```http
+X-API-Key: your-secret
+```
+
+Troubleshooting checklist:
+
+1. Verify the terminal date, time, timezone, gateway, and DNS.
+2. Confirm `/health` works from outside the hosting network.
+3. Look for `/iclock/` requests in server logs.
+4. For Railway, confirm domain mode and HTTPS are both enabled.
+5. Confirm the database volume or disk is writable and persistent.
+
+## Attendance API
 
 JSON:
 
 ```http
-GET /api/v1/attendance?after_id=0&limit=100
+GET /api/v1/attendance?after_id=0&limit=500
 ```
-
-Optional filters: `employee_id`, `serial_number`, `from`, and `to`.
 
 CSV:
 
@@ -102,84 +204,84 @@ CSV:
 GET /api/v1/attendance.csv?from=2026-06-01&to=2026-07-01
 ```
 
-The response contains `next_after_id`. Save this cursor in your HRMS and use it on the next request. Processing by monotonically increasing ID plus your own unique constraint gives reliable incremental synchronization.
+Optional filters:
 
-## Node.js / Next.js example
+- `after_id`
+- `limit` (maximum 10,000)
+- `employee_id`
+- `serial_number`
+- `from`
+- `to`
+
+Save `next_after_id` in the HRMS and use it as the next cursor. Add a unique
+constraint on `event_key` in the consuming system.
+
+Example:
 
 ```js
 const response = await fetch(
-  'http://192.168.0.101:8090/api/v1/attendance?after_id=0&limit=500',
-  { headers: process.env.SENSEFACE_API_KEY
-      ? { 'X-API-Key': process.env.SENSEFACE_API_KEY }
-      : {} }
+  `${process.env.SENSEFACE_URL}/api/v1/attendance?after_id=${cursor}&limit=500`,
+  { headers: { "X-API-Key": process.env.SENSEFACE_API_KEY } },
 );
 if (!response.ok) throw new Error(`SenseFace API ${response.status}`);
 const page = await response.json();
-for (const event of page.data) {
-  // Upsert using event.event_key, then persist page.next_after_id.
-}
 ```
 
-## NestJS example
+## Employee API
 
-```ts
-const page = await fetch(
-  `${process.env.SENSEFACE_URL}/api/v1/attendance?after_id=${cursor}&limit=500`,
-  { headers: process.env.SENSEFACE_API_KEY
-      ? { 'X-API-Key': process.env.SENSEFACE_API_KEY }
-      : {} },
-).then(r => {
-  if (!r.ok) throw new Error(`SenseFace API ${r.status}`);
-  return r.json();
-});
+```http
+GET /api/v1/employees
 ```
 
-Place a unique database constraint on `event_key` in the consuming application.
+Attendance includes `employee_name`. If attendance arrives before its USER
+record, the bridge creates a placeholder, requests a full USERINFO sync, and
+backfills the name after the terminal supplies it.
 
-## Optional API key
+## Time handling
 
-Before starting, set an environment variable. Device endpoints remain available, while `/api/v1/*` requires the header `X-API-Key`.
+- `event_time` is the terminal's local punch time.
+- `received_at` and employee `updated_at` are stored in UTC.
+- `time_status=ok` means event and receipt times are within the configured
+  tolerance.
+- `time_status=delayed_or_clock_skew` means the punch was uploaded later or the
+  device clock may have been wrong.
 
-```powershell
-$env:SENSEFACE_API_KEY = 'replace-with-a-long-random-value'
-.\Start-SenseFace-Bridge.ps1
+Defaults:
+
+```text
+SENSEFACE_TIMEZONE=Asia/Dhaka
+SENSEFACE_CLOCK_MAX_SKEW=300
 ```
 
-Do not expose port 8090 directly to the public internet. Put an authenticated HTTPS reverse proxy or VPN in front if remote access is required.
+The bridge supplies its local time during ADMS registration. Also configure the
+terminal's timezone and automatic time synchronization. Offline punches retain
+the time recorded by the terminal; receipt time cannot reconstruct a wrong
+offline device clock.
 
-## Clock configuration
+## Configuration variables
 
-The defaults are suitable for Bangladesh:
+| Variable | Default | Purpose |
+|---|---:|---|
+| `PORT` | `8090` | Standard cloud-assigned port |
+| `SENSEFACE_PORT` | unset | Overrides `PORT` |
+| `SENSEFACE_HOST` | `0.0.0.0` | Bind address |
+| `SENSEFACE_DATA_DIR` | `./data` | Persistent data directory |
+| `SENSEFACE_TIMEZONE` | `Asia/Dhaka` | Terminal local timezone |
+| `SENSEFACE_CLOCK_MAX_SKEW` | `300` | Allowed clock difference in seconds |
+| `SENSEFACE_API_KEY` | empty | Protects `/api/v1/*` when set |
 
-```powershell
-$env:SENSEFACE_TIMEZONE = 'Asia/Dhaka'
-$env:SENSEFACE_CLOCK_MAX_SKEW = '300'
-```
+## Data safety and security
 
-`event_time` remains the timestamp recorded by the terminal. The API additionally
-returns `delivery_delay_seconds` and `time_status`, allowing the HRMS to quarantine
-suspicious records instead of silently accepting a bad device clock.
+- Raw requests and parsed events are committed to SQLite before success is
+  returned.
+- WAL mode, full synchronization, and a busy timeout are enabled.
+- Repeated requests and attendance events are deduplicated.
+- Existing events are not automatically deleted or rewritten.
+- Device endpoints must remain reachable by the terminal.
+- Protect HRMS API endpoints with `SENSEFACE_API_KEY`.
+- Use HTTPS for internet deployments.
+- Back up persistent storage regularly.
 
-When attendance arrives before its USER record, the bridge creates an employee
-placeholder and requests a full `USERINFO` migration from the terminal. USER data
-subsequently replaces the placeholder and backfills `employee_name` on attendance.
+## License
 
-## Employee directory
-
-Endpoint: GET /api/v1/employees
-
-Employee names are stored in the employees table. Attendance JSON includes employee_name when the device has pushed the corresponding USER record.
-
-## Timezone note
-
-The time differences in the data are intentional, not timing bugs:
-
-- `event_time` — device-local Bangladesh time, e.g. `13:46:45`
-- `received_at` — server UTC (+00:00), e.g. `07:46:46`
-
-07:46 UTC + 6 hours = 13:46 Bangladesh time. The two values are consistent once you account for the offset.
-
-Similarly, `updated_at` on employee records stores when the server received/synchronised the data (UTC), not the employee creation time.
-
-UTC storage is safer for databases, but the different formats can be confusing. The HRMS UI should convert `received_at` and `updated_at` to `Asia/Dhaka` before displaying them.
-
+See [LICENSE](LICENSE).
